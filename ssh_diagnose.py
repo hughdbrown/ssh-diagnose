@@ -54,6 +54,7 @@ class SSHDiagnostic:
         self, cmd: List[str], timeout: int = 10, capture_error: bool = True
     ) -> Tuple[int, str, str]:
         """Execute a system command and return returncode, stdout, stderr"""
+        print(f"{cmd}")
         try:
             result = subprocess.run(
                 cmd, encoding="utf-8", capture_output=True, timeout=timeout, cwd="."
