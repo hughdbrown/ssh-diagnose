@@ -17,6 +17,7 @@ import subprocess
 import socket
 import os
 import sys
+import time
 import ipaddress
 from pathlib import Path
 from typing import List, Tuple, Optional
@@ -75,6 +76,55 @@ class SSHDiagnostic:
             ip_obj = ipaddress.ip_address(ip_string)
             return isinstance(ip_obj, ipaddress.IPv6Address)
         except ValueError:
+            return False
+
+    def check_systemd_socket_activation(self) -> Tuple[bool, bool]:
+        """Check if SSH is using systemd socket activation
+        Returns: (socket_exists, socket_active)
+        """
+        # Check if ssh.socket exists and is enabled
+        socket_exists = False
+        socket_active = False
+
+        # Check for ssh.socket
+        rc, stdout, stderr = self.run_command(["systemctl", "list-unit-files", "ssh.socket"])
+        if rc == 0 and "ssh.socket" in stdout:
+            socket_exists = True
+        else:
+            # Try sshd.socket
+            rc, stdout, stderr = self.run_command(["systemctl", "list-unit-files", "sshd.socket"])
+            if rc == 0 and "sshd.socket" in stdout:
+                socket_exists = True
+
+        if socket_exists:
+            # Check if socket is active
+            rc, stdout, stderr = self.run_command(["systemctl", "is-active", "ssh.socket"])
+            if rc == 0:
+                socket_active = True
+            else:
+                rc, stdout, stderr = self.run_command(["systemctl", "is-active", "sshd.socket"])
+                socket_active = rc == 0
+
+        return socket_exists, socket_active
+
+    def trigger_sshd_startup(self) -> bool:
+        """Attempt to trigger sshd startup via connection attempt
+        Returns: True if successful, False otherwise
+        """
+        try:
+            # Make a brief connection attempt to trigger socket activation
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(1)
+            result = sock.connect_ex(("127.0.0.1", self.ssh_port))
+            sock.close()
+
+            # Give systemd a moment to start the service
+            time.sleep(2)
+
+            # Check if sshd process is now running
+            rc, stdout, stderr = self.run_command(["pgrep", "-f", "sshd"])
+            return rc == 0 and stdout.strip()
+        except Exception:
             return False
 
     def log_result(
@@ -790,6 +840,26 @@ class SSHDiagnostic:
 
     def test_ssh_daemon_running(self):
         """Test if SSH daemon is running and enabled"""
+        # First check for systemd socket activation
+        socket_exists, socket_active = self.check_systemd_socket_activation()
+
+        if socket_exists:
+            if socket_active:
+                self.log_result(
+                    "SSH Socket Activation",
+                    TestResult.PASS,
+                    "SSH socket activation is enabled and active",
+                    "systemd is managing SSH port 22 and will start sshd on demand",
+                )
+            else:
+                self.log_result(
+                    "SSH Socket Activation",
+                    TestResult.WARN,
+                    "SSH socket activation configured but not active",
+                    "Socket may need to be started",
+                    "Start socket: sudo systemctl start ssh.socket",
+                )
+
         # Check if SSH service is active
         rc, stdout, stderr = self.run_command(["systemctl", "is-active", "ssh"])
         ssh_active = rc == 0
@@ -799,27 +869,38 @@ class SSHDiagnostic:
             rc, stdout, stderr = self.run_command(["systemctl", "is-active", "sshd"])
             ssh_active = rc == 0
 
-        if not ssh_active:
+        if not ssh_active and not (socket_exists and socket_active):
             self.log_result(
                 "SSH Daemon Status",
                 TestResult.FAIL,
-                "SSH daemon is not running",
+                "SSH daemon is not running and no socket activation",
                 "SSH service is inactive or not installed",
                 "Start SSH: sudo systemctl start ssh (or sshd)",
             )
-        else:
+        elif ssh_active:
             self.log_result(
                 "SSH Daemon Status", TestResult.PASS, "SSH daemon is running"
             )
+        elif socket_exists and socket_active:
+            self.log_result(
+                "SSH Daemon Status",
+                TestResult.PASS,
+                "SSH daemon ready (systemd socket activation)",
+                "Daemon will start automatically on first connection",
+            )
 
-        # Check if SSH service is enabled
-        rc, stdout, stderr = self.run_command(["systemctl", "is-enabled", "ssh"])
-        ssh_enabled = rc == 0
-
-        if not ssh_enabled:
-            # Try sshd instead of ssh
-            rc, stdout, stderr = self.run_command(["systemctl", "is-enabled", "sshd"])
+        # Check if SSH service is enabled (or socket activation is configured)
+        ssh_enabled = False
+        if socket_exists and socket_active:
+            ssh_enabled = True  # Socket activation counts as "enabled"
+        else:
+            rc, stdout, stderr = self.run_command(["systemctl", "is-enabled", "ssh"])
             ssh_enabled = rc == 0
+
+            if not ssh_enabled:
+                # Try sshd instead of ssh
+                rc, stdout, stderr = self.run_command(["systemctl", "is-enabled", "sshd"])
+                ssh_enabled = rc == 0
 
         if not ssh_enabled:
             self.log_result(
@@ -844,13 +925,31 @@ class SSHDiagnostic:
                 f"SSH daemon process running (PIDs: {', '.join(ssh_pids)})",
             )
         else:
-            self.log_result(
-                "SSH Process",
-                TestResult.FAIL,
-                "No SSH daemon process found",
-                "SSH daemon may have crashed or not started",
-                "Check SSH logs: sudo journalctl -u ssh -f",
-            )
+            if socket_exists and socket_active:
+                # Try to trigger sshd startup
+                if self.trigger_sshd_startup():
+                    self.log_result(
+                        "SSH Process",
+                        TestResult.PASS,
+                        "SSH daemon started via socket activation",
+                        "systemd successfully started sshd on connection attempt",
+                    )
+                else:
+                    self.log_result(
+                        "SSH Process",
+                        TestResult.WARN,
+                        "SSH socket active but daemon won't start",
+                        "systemd socket activation may be misconfigured",
+                        "Check SSH logs: sudo journalctl -u ssh -f",
+                    )
+            else:
+                self.log_result(
+                    "SSH Process",
+                    TestResult.FAIL,
+                    "No SSH daemon process found",
+                    "SSH daemon may have crashed or not started",
+                    "Check SSH logs: sudo journalctl -u ssh -f",
+                )
 
     def test_ssh_configuration(self):
         """Test SSH configuration file"""
@@ -1043,6 +1142,9 @@ class SSHDiagnostic:
 
     def test_ssh_port_binding(self):
         """Test if SSH is properly binding to ports"""
+        # First check for systemd socket activation
+        socket_exists, socket_active = self.check_systemd_socket_activation()
+
         # Check what's listening on SSH port
         rc, stdout, stderr = self.run_command(["netstat", "-tlnp"])
 
@@ -1060,41 +1162,62 @@ class SSHDiagnostic:
 
         # Look for SSH port
         ssh_listening = False
+        systemd_listening = False
         listening_details = []
 
         for line in stdout.split("\n"):
             if f":{self.ssh_port} " in line or f":{self.ssh_port}\t" in line:
                 ssh_listening = True
                 listening_details.append(line.strip())
+                # Check if systemd is the one listening
+                if "systemd" in line:
+                    systemd_listening = True
 
         if not ssh_listening:
-            self.log_result(
-                "SSH Port Binding",
-                TestResult.FAIL,
-                f"SSH is not listening on port {self.ssh_port}",
-                "SSH daemon may not be running or misconfigured",
-                "Check SSH config and restart: sudo systemctl restart ssh",
-            )
-        else:
-            # Check if listening on all interfaces
-            all_interfaces = any(
-                "0.0.0.0:" in detail or ":::" in detail for detail in listening_details
-            )
-
-            if all_interfaces:
+            if socket_exists and socket_active:
                 self.log_result(
                     "SSH Port Binding",
-                    TestResult.PASS,
-                    f"SSH listening on port {self.ssh_port} (all interfaces)",
+                    TestResult.WARN,
+                    f"SSH socket active but port {self.ssh_port} not visible in netstat",
+                    "systemd may be holding the socket internally",
+                    "This is normal for socket activation",
                 )
             else:
                 self.log_result(
                     "SSH Port Binding",
-                    TestResult.WARN,
-                    f"SSH listening on port {self.ssh_port} but not all interfaces",
-                    "May only accept local connections",
-                    "Check ListenAddress in sshd_config",
+                    TestResult.FAIL,
+                    f"SSH is not listening on port {self.ssh_port}",
+                    "SSH daemon may not be running or misconfigured",
+                    "Check SSH config and restart: sudo systemctl restart ssh",
                 )
+        else:
+            if systemd_listening:
+                self.log_result(
+                    "SSH Port Binding",
+                    TestResult.PASS,
+                    f"systemd managing SSH port {self.ssh_port} (socket activation)",
+                    "Port is managed by systemd socket activation",
+                )
+            else:
+                # Check if listening on all interfaces
+                all_interfaces = any(
+                    "0.0.0.0:" in detail or ":::" in detail for detail in listening_details
+                )
+
+                if all_interfaces:
+                    self.log_result(
+                        "SSH Port Binding",
+                        TestResult.PASS,
+                        f"SSH listening on port {self.ssh_port} (all interfaces)",
+                    )
+                else:
+                    self.log_result(
+                        "SSH Port Binding",
+                        TestResult.WARN,
+                        f"SSH listening on port {self.ssh_port} but not all interfaces",
+                        "May only accept local connections",
+                        "Check ListenAddress in sshd_config",
+                    )
 
         # Test local connection to SSH port
         try:
@@ -2530,7 +2653,7 @@ class SSHDiagnostic:
         if self.is_ipv6_address(external_ip):
             nmap_cmd.append("-6")
         nmap_cmd.append(external_ip)
-        
+
         rc, stdout, stderr = self.run_command(nmap_cmd)
         if rc == 0:
             if "open" in stdout:
