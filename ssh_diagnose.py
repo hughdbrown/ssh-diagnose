@@ -17,6 +17,7 @@ import subprocess
 import socket
 import os
 import sys
+import ipaddress
 from pathlib import Path
 from typing import List, Tuple, Optional
 from dataclasses import dataclass
@@ -67,6 +68,14 @@ class SSHDiagnostic:
             )
         except Exception as e:
             return -1, "", str(e)
+
+    def is_ipv6_address(self, ip_string: str) -> bool:
+        """Check if the given string is a valid IPv6 address"""
+        try:
+            ip_obj = ipaddress.ip_address(ip_string)
+            return isinstance(ip_obj, ipaddress.IPv6Address)
+        except ValueError:
+            return False
 
     def log_result(
         self,
@@ -2517,9 +2526,12 @@ class SSHDiagnostic:
             )
 
         # Check for common blocking services
-        rc, stdout, stderr = self.run_command(
-            ["nmap", "-p", str(self.ssh_port), external_ip]
-        )
+        nmap_cmd = ["nmap", "-p", str(self.ssh_port)]
+        if self.is_ipv6_address(external_ip):
+            nmap_cmd.append("-6")
+        nmap_cmd.append(external_ip)
+        
+        rc, stdout, stderr = self.run_command(nmap_cmd)
         if rc == 0:
             if "open" in stdout:
                 self.log_result(
